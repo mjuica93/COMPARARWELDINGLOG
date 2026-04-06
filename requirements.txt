@@ -3,3 +3,4 @@ openpyxl
 pyxlsb
 numpy
 pyarrow
+streamlit
