@@ -4,7 +4,7 @@ WELDLOG Compare — Comparación genérica de versiones de Welding Log
 Ejecutar: streamlit run weldlog_compare.py
 """
 
-import io, os, re, tempfile, warnings
+import io, json, os, re, tempfile, warnings
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -71,6 +71,48 @@ def pick(col, left_v, right_v, date_cols):
         except Exception:
             return right_v, "fecha→der"
     return right_v, "der→machaca"
+
+def make_copy_tsv(left_raw_df, r_row, l_row, integrate_cols, date_cols, overrides=None):
+    """
+    Devuelve (cols, vals, tsv) en el orden de columnas del Excel BASE (izquierda).
+    overrides: dict {col: "Base" | "Propuesta"} para respetar selecciones del usuario.
+    """
+    cols = [c for c in left_raw_df.columns if not c.startswith("_")]
+    vals = []
+    for c in cols:
+        lv = l_row[c] if l_row is not None and c in l_row.index else None
+        rv = r_row[c] if r_row is not None and c in r_row.index else None
+        if c in integrate_cols:
+            winner, _ = pick(c, lv, rv, date_cols)
+            if overrides and overrides.get(c) == "Base":
+                vals.append(norm(lv))
+            else:
+                vals.append(norm(winner))
+        else:
+            vals.append(norm(lv if lv is not None else rv))
+    return cols, vals, "\t".join(vals)
+
+def render_copy_section(left_raw_df, r_row, l_row, integrate_cols, date_cols,
+                        overrides=None, n_preview=10):
+    """Muestra tabla previa + bloque de código listo para copiar (orden del Excel base)."""
+    cols, vals, tsv = make_copy_tsv(
+        left_raw_df, r_row, l_row, integrate_cols, date_cols, overrides=overrides
+    )
+    prev_n = min(n_preview, len(cols))
+    st.caption(
+        f"Vista previa — primeras **{prev_n}** de **{len(cols)}** columnas "
+        f"(en el orden exacto de tu Excel base):"
+    )
+    st.dataframe(
+        pd.DataFrame([vals[:prev_n]], columns=cols[:prev_n]),
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.caption(
+        "Haz clic en el icono **📋** (arriba a la derecha del recuadro de abajo) "
+        "para copiar toda la fila y pégala en tu Excel con **Ctrl+V**:"
+    )
+    st.code(tsv, language=None)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # LECTURA DE ARCHIVOS
@@ -367,6 +409,125 @@ CSS = """
 """
 
 # ═══════════════════════════════════════════════════════════════════════════
+# SESIÓN — guardar / restaurar progreso
+# ═══════════════════════════════════════════════════════════════════════════
+def session_to_json():
+    def _ser(obj):
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        if isinstance(obj, (set, frozenset)):
+            return list(obj)
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        return str(obj)
+
+    ss = st.session_state
+    data = {
+        "version":   1,
+        "timestamp": datetime.now().isoformat(),
+        "config": {
+            "left_name":      ss.get("cfg_left_name",      ""),
+            "left_sheet":     ss.get("cfg_left_sheet",     ""),
+            "left_hdr":       ss.get("cfg_left_hdr",       5),
+            "right_name":     ss.get("cfg_right_name",     ""),
+            "right_sheet":    ss.get("cfg_right_sheet",    ""),
+            "right_hdr":      ss.get("cfg_right_hdr",      4),
+            "iso_left":       ss.get("cfg_iso_left",       ""),
+            "iso_right":      ss.get("cfg_iso_right",      ""),
+            "key_mode_l":     ss.get("cfg_key_mode_l",     "Columna directa"),
+            "key_col_l_s":    ss.get("cfg_key_col_l_s",    ""),
+            "key_col_l_a":    ss.get("cfg_key_col_l_a",    ""),
+            "key_col_l_b":    ss.get("cfg_key_col_l_b",    ""),
+            "key_mode_r":     ss.get("cfg_key_mode_r",     "Columna directa"),
+            "key_col_r_s":    ss.get("cfg_key_col_r_s",    ""),
+            "key_col_r_a":    ss.get("cfg_key_col_r_a",    ""),
+            "key_col_r_b":    ss.get("cfg_key_col_r_b",    ""),
+            "integrate_cols": ss.get("cfg_integrate_cols", []),
+            "date_cols":      list(ss.get("cfg_date_cols", set())),
+        },
+        "changes_exist": [
+            [int(xl), col, _ser(val)]
+            for xl, col, val in ss.get("changes_exist", [])
+        ],
+        "changes_new": [
+            {k: _ser(v) for k, v in row.items()}
+            for row in ss.get("changes_new", [])
+        ],
+        "done_isos": list(ss.get("done_isos", set())),
+        "iso_idx":   int(ss.get("iso_idx", 0)),
+    }
+    return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def apply_session_json(raw_bytes):
+    try:
+        data = json.loads(raw_bytes)
+    except Exception as e:
+        return False, str(e)
+
+    ss  = st.session_state
+    cfg = data.get("config", {})
+
+    # Pre-rellenar los widgets del formulario de configuración
+    widget_map = {
+        "left_sheet":       cfg.get("left_sheet"),
+        "left_hdr":         cfg.get("left_hdr"),
+        "right_sheet":      cfg.get("right_sheet"),
+        "right_hdr":        cfg.get("right_hdr"),
+        "iso_col_left":     cfg.get("iso_left"),
+        "iso_col_right":    cfg.get("iso_right"),
+        "key_mode_l":       cfg.get("key_mode_l"),
+        "key_col_l_single": cfg.get("key_col_l_s"),
+        "key_col_l_a":      cfg.get("key_col_l_a"),
+        "key_col_l_b":      cfg.get("key_col_l_b"),
+        "key_mode_r":       cfg.get("key_mode_r"),
+        "key_col_r_single": cfg.get("key_col_r_s"),
+        "key_col_r_a":      cfg.get("key_col_r_a"),
+        "key_col_r_b":      cfg.get("key_col_r_b"),
+        "integrate_cols":   cfg.get("integrate_cols"),
+        "date_cols":        cfg.get("date_cols"),
+    }
+    for key, val in widget_map.items():
+        if val is not None:
+            ss[key] = val
+
+    # Restaurar valores cfg_
+    ss.cfg_left_name      = cfg.get("left_name",      "")
+    ss.cfg_left_sheet     = cfg.get("left_sheet",     "")
+    ss.cfg_left_hdr       = int(cfg.get("left_hdr",   5))
+    ss.cfg_right_name     = cfg.get("right_name",     "")
+    ss.cfg_right_sheet    = cfg.get("right_sheet",    "")
+    ss.cfg_right_hdr      = int(cfg.get("right_hdr",  4))
+    ss.cfg_iso_left       = cfg.get("iso_left",       "")
+    ss.cfg_iso_right      = cfg.get("iso_right",      "")
+    ss.cfg_key_mode_l     = cfg.get("key_mode_l",     "Columna directa")
+    ss.cfg_key_col_l_s    = cfg.get("key_col_l_s",    "")
+    ss.cfg_key_col_l_a    = cfg.get("key_col_l_a",    "")
+    ss.cfg_key_col_l_b    = cfg.get("key_col_l_b",    "")
+    ss.cfg_key_mode_r     = cfg.get("key_mode_r",     "Columna directa")
+    ss.cfg_key_col_r_s    = cfg.get("key_col_r_s",    "")
+    ss.cfg_key_col_r_a    = cfg.get("key_col_r_a",    "")
+    ss.cfg_key_col_r_b    = cfg.get("key_col_r_b",    "")
+    ss.cfg_integrate_cols = cfg.get("integrate_cols", [])
+    ss.cfg_date_cols      = set(cfg.get("date_cols",  []))
+
+    # Restaurar progreso de trabajo
+    ss.changes_exist     = [tuple(x) for x in data.get("changes_exist", [])]
+    ss.changes_new       = data.get("changes_new",  [])
+    ss.done_isos         = set(data.get("done_isos", []))
+    ss.iso_idx           = int(data.get("iso_idx",   0))
+
+    ss.cfg_ready         = False
+    ss.session_restored  = True
+    ss.session_timestamp = data.get("timestamp", "")[:16].replace("T", " ")
+    ss.session_left_name  = cfg.get("left_name",  "")
+    ss.session_right_name = cfg.get("right_name", "")
+    return True, ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # COMPONENTES
 # ═══════════════════════════════════════════════════════════════════════════
 def render_estado(estado):
@@ -422,12 +583,13 @@ ss = st.session_state
 
 # ── defaults de session ────────────────────────────────────────────────────
 for k, v in {
-    "iso_idx":       0,
-    "done_isos":     set(),
-    "changes_exist": [],
-    "changes_new":   [],
-    "detail_key":    None,
-    "cfg_ready":     False,
+    "iso_idx":          0,
+    "done_isos":        set(),
+    "changes_exist":    [],
+    "changes_new":      [],
+    "detail_key":       None,
+    "cfg_ready":        False,
+    "session_restored": False,
 }.items():
     if k not in ss:
         ss[k] = v
@@ -435,6 +597,33 @@ for k, v in {
 # ═══════════════════════════════════════════════════════════════════════════
 # PANEL DE CONFIGURACIÓN (expansible en la parte superior)
 # ═══════════════════════════════════════════════════════════════════════════
+# ── Restaurar sesión guardada ──────────────────────────────────────────────
+if not ss.cfg_ready and not ss.session_restored:
+    with st.expander("📂 Restaurar sesión guardada", expanded=False):
+        st.caption("Sube el archivo `.json` que descargaste en una sesión anterior para continuar donde lo dejaste.")
+        sess_file = st.file_uploader(
+            "Archivo de sesión",
+            type=["json"],
+            key="session_uploader",
+            label_visibility="collapsed",
+        )
+        if sess_file:
+            ok, err = apply_session_json(sess_file.read())
+            if ok:
+                st.rerun()
+            else:
+                st.error(f"Error al leer la sesión: {err}")
+
+if ss.session_restored:
+    n_ch = len(ss.changes_exist) + len(ss.changes_new)
+    st.info(
+        f"📂 **Sesión restaurada** ({ss.get('session_timestamp','')}) — "
+        f"{n_ch} cambios guardados · {len(ss.done_isos)} ISOs revisados.  \n"
+        f"Sube los archivos **{ss.session_left_name}** y **{ss.session_right_name}** "
+        "y pulsa **Aplicar configuración** para continuar.",
+        icon="ℹ️",
+    )
+
 with st.expander("⚙️ Configuración de archivos", expanded=not ss.cfg_ready):
     col_left, col_sep, col_right = st.columns([5, 1, 5])
 
@@ -635,11 +824,14 @@ with st.expander("⚙️ Configuración de archivos", expanded=not ss.cfg_ready)
             ss.cfg_key_col_r_b    = key_col_r_b
             ss.cfg_integrate_cols = list(integrate_cols)
             ss.cfg_date_cols      = set(date_cols)
-            ss.cfg_ready          = True
-            ss.iso_idx            = 0
-            ss.done_isos          = set()
-            ss.changes_exist      = []
-            ss.changes_new        = []
+            ss.cfg_ready = True
+            # Si estamos restaurando una sesión, preservar el progreso ya guardado
+            if not ss.get("session_restored"):
+                ss.iso_idx       = 0
+                ss.done_isos     = set()
+                ss.changes_exist = []
+                ss.changes_new   = []
+            ss.session_restored = False
             st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -700,6 +892,15 @@ with st.sidebar:
     st.caption(
         f"**Izq.:** {ss.cfg_left_name}  \n"
         f"**Der.:** {ss.cfg_right_name}"
+    )
+    ts_sess  = datetime.now().strftime("%d%m%Y_%H%M")
+    st.download_button(
+        "💾 Guardar sesión",
+        data=session_to_json(),
+        file_name=f"sesion_weldlog_{ts_sess}.json",
+        mime="application/json",
+        use_container_width=True,
+        help="Descarga el progreso actual para restaurarlo después aunque refresques la página",
     )
     if st.button("🔄 Nueva comparación", use_container_width=True):
         for k in ["cfg_ready", "cfg_left_bytes", "cfg_left_name", "cfg_left_sheet",
@@ -938,6 +1139,32 @@ with tab_cmp:
         column_config={"Estado": st.column_config.TextColumn("Estado", width=80)},
     )
 
+    # ── Copiar fila al portapapeles ────────────────────────────────────────
+    st.divider()
+    with st.expander("📋 Copiar fila al portapapeles (para pegar en Excel)", expanded=False):
+        copy_keys = df_f[KEY].dropna().tolist() if KEY in df_f.columns else []
+        if copy_keys:
+            copy_sel = st.selectbox(
+                "Selecciona costura a copiar",
+                copy_keys,
+                format_func=lambda k: (
+                    f"{k}  [{df_view.loc[df_view[KEY]==k,'Estado'].values[0]}]"
+                    if not df_view[df_view[KEY]==k].empty else k
+                ),
+                key="copy_sel_tab1",
+            )
+            if copy_sel:
+                _r_match = df_right[df_right[KEY] == copy_sel]
+                _l_match = df_left [df_left [KEY] == copy_sel] if KEY in df_left.columns else pd.DataFrame()
+                if not _r_match.empty:
+                    render_copy_section(
+                        df_left_raw,
+                        _r_match.iloc[0],
+                        _l_match.iloc[0] if not _l_match.empty else None,
+                        integrate_cols,
+                        date_cols,
+                    )
+
     st.divider()
     st.markdown("**Integrar isométrico:**")
     a1, a2, a3, a4 = st.columns(4)
@@ -1163,6 +1390,18 @@ with tab_detail:
                         row_d[KEY] = sel_key
                         ss.changes_new.append(row_d)
                         st.success("Costura añadida.")
+
+                # ── Copiar costura al portapapeles ─────────────────────────
+                st.divider()
+                if r_r is not None or l_r is not None:
+                    render_copy_section(
+                        df_left_raw,
+                        r_r,
+                        l_r,
+                        integrate_cols,
+                        date_cols,
+                        n_preview=8,
+                    )
 
             with d2:
                 if r_r is not None:
