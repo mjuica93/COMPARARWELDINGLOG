@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.xlsb
+*.xlsx
+*.xlsm
+~$*
+old/
+*.json
+.streamlit/secrets.toml
